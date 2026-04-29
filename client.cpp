@@ -4,85 +4,83 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <chrono>
+#include <iomanip>
 #include "protocol.h"
 #include "utils.h"
 
-// Реализация активного соединения через connect() (раздел 2.1) 
-int connect_to_server(const std::string& ip, int port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return -1;
-
-    sockaddr_in serv_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip.c_str(), &serv_addr.sin_addr);
-
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        close(sock);
-        return -1;
-    }
-    return sock;
-}
-
-void send_file(const std::string& filepath, int server_socket) {
-    std::ifstream infile(filepath, std::ios::binary);
-    if (!infile) return;
+void send_file(const std::string& path, const std::string& ip, int port, int fail_rate) {
+    std::ifstream infile(path, std::ios::binary);
+    if (!infile) { std::cerr << "File error" << std::endl; return; }
 
     infile.seekg(0, std::ios::end);
     uint64_t total_size = infile.tellg();
     infile.seekg(0, std::ios::beg);
 
-    // Фаза Handshake 
-    ProtocolHeader sync_hdr = { Command::SYN, total_size, 0, 0 };
-    if (send(server_socket, &sync_hdr, sizeof(sync_hdr), 0) < (ssize_t)sizeof(sync_hdr)) return;
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
 
-    ProtocolHeader resume_hdr;
-    if (recv(server_socket, &resume_hdr, sizeof(resume_hdr), MSG_WAITALL) <= 0) return;
-
-    uint64_t current_offset = 0;
-    if (resume_hdr.type == Command::RESUME) {
-        current_offset = resume_hdr.offset;
-        infile.seekg(current_offset, std::ios::beg);
-        std::cout << "Resuming from: " << current_offset << " bytes." << std::endl;
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cerr << "Connect failed" << std::endl; return;
     }
 
-    const size_t CHUNK_SIZE = 4096;
-    std::vector<char> buffer(CHUNK_SIZE);
+    // Handshake
+    ProtocolHeader sync = { Command::SYN, total_size, 0, 0 };
+    send(sock, &sync, sizeof(sync), 0);
 
-    while (current_offset < total_size) {
-        infile.read(buffer.data(), CHUNK_SIZE);
-        size_t bytes_read = infile.gcount();
-        if (bytes_read <= 0) break;
+    ProtocolHeader resume;
+    recv(sock, &resume, sizeof(resume), MSG_WAITALL);
+    uint64_t offset = resume.offset;
+    infile.seekg(offset);
 
-        ProtocolHeader data_hdr;
-        data_hdr.type = Command::DATA;
-        data_hdr.offset = current_offset;
-        data_hdr.payloadLen = static_cast<uint32_t>(bytes_read);
-        data_hdr.checksum = calculate_crc32(reinterpret_cast<uint8_t*>(buffer.data()), bytes_read);
+    std::cout << "[CLIENT] Starting from: " << offset << " / " << total_size << " bytes." << std::endl;
 
-        // Проверка возвращаемого значения send() (раздел 2.1) 
-        if (send(server_socket, &data_hdr, sizeof(data_hdr), 0) < (ssize_t)sizeof(data_hdr)) break;
-        if (send(server_socket, buffer.data(), bytes_read, 0) < (ssize_t)bytes_read) break;
+    const size_t CHUNK = 4096;
+    std::vector<char> buffer(CHUNK);
+    auto start_time = std::chrono::steady_clock::now();
+    srand(time(0));
 
-        ProtocolHeader ack_hdr;
-        if (recv(server_socket, &ack_hdr, sizeof(ack_hdr), MSG_WAITALL) <= 0 || ack_hdr.type != Command::ACK) {
-            std::cerr << "\nConnection error. Use resume later." << std::endl;
-            break;
+    while (offset < total_size) {
+        infile.read(buffer.data(), CHUNK);
+        size_t read = infile.gcount();
+
+        ProtocolHeader data = { Command::DATA, offset, (uint32_t)read, calculate_crc32((uint8_t*)buffer.data(), read) };
+        send(sock, &data, sizeof(data), 0);
+        send(sock, buffer.data(), read, 0);
+
+        ProtocolHeader ack;
+        if (recv(sock, &ack, sizeof(ack), MSG_WAITALL) <= 0 || ack.type != Command::ACK) break;
+
+        offset += read;
+
+        // Расчет прогресса и скорости
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - start_time).count();
+        double speed = (offset - resume.offset) / (elapsed * 1024 + 0.001);
+
+        std::cout << "\r[PROGRESS] " << std::fixed << std::setprecision(2) 
+                  << (double)offset/total_size*100 << "% | Speed: " << speed << " KB/s" << std::flush;
+
+        // Эмуляция сбоя
+        if (fail_rate > 0 && (rand() % 100 < fail_rate)) {
+            std::cout << "\n[FAILURE] Simulated network drop!" << std::endl;
+            close(sock); exit(1);
         }
-
-        current_offset += bytes_read;
-        std::cout << "\rProgress: " << (current_offset * 100 / total_size) << "%" << std::flush;
     }
-
-    std::cout << "\nDone." << std::endl;
-    infile.close();
+    
+    if (offset >= total_size) std::cout << "\n[SUCCESS] Transfer complete." << std::endl;
+    close(sock);
 }
 
 int main() {
-    int sock = connect_to_server("127.0.0.1", 8080);
-    if (sock != -1) {
-        send_file("test_file.bin", sock);
-        close(sock);
-    }
+    std::string ip, path; int port, fail;
+    std::cout << "SERVER IP: "; std::cin >> ip;
+    std::cout << "PORT: "; std::cin >> port;
+    std::cout << "FILE PATH: "; std::cin >> path;
+    std::cout << "FAIL CHANCE (0-10%): "; std::cin >> fail;
+    send_file(path, ip, port, fail);
     return 0;
 }
