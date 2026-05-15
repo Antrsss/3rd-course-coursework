@@ -28,10 +28,9 @@ void send_file(const std::string& path, const std::string& save_name, const std:
         std::cerr << "Connect failed" << std::endl; return;
     }
 
-    // Handshake: отправляем SYN и длину имени файла в payloadLen
     ProtocolHeader sync = { Command::SYN, total_size, (uint32_t)save_name.size(), 0 };
     send(sock, &sync, sizeof(sync), 0);
-    send(sock, save_name.c_str(), save_name.size(), 0); // Отправляем само имя
+    send(sock, save_name.c_str(), save_name.size(), 0);
 
     ProtocolHeader resume;
     if (recv(sock, &resume, sizeof(resume), MSG_WAITALL) <= 0) return;
